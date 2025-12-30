@@ -72,6 +72,44 @@ def tangent_space_projection(x):
     return tangent_vec
 
 # ==========================================
+# 新增: Adaptive Graph Learning (自适应图学习)
+# ==========================================
+class GraphLearner(nn.Module):
+    def __init__(self, input_dim, top_k=10):
+        super(GraphLearner, self).__init__()
+        self.top_k = top_k
+        # 两层 MLP 用于特征变换
+        self.weight_tensor = nn.Parameter(torch.Tensor(input_dim, input_dim))
+        nn.init.xavier_uniform_(self.weight_tensor)
+        
+    def forward(self, x):
+        # x: (Batch, Nodes, Features)
+        # 1. 节点特征变换
+        x_trans = torch.matmul(x, self.weight_tensor) # (B, N, F)
+        
+        # Cosine Similarity: Normalize features first
+        x_trans = F.normalize(x_trans, p=2, dim=-1)
+        
+        # 2. 计算注意力分数/相似度 (B, N, N)
+        # Score = ReLu(X * X^T) with normalized inputs -> Cosine Similarity [0, 1] after ReLU
+        scores = torch.bmm(x_trans, x_trans.transpose(1, 2))
+        scores = F.relu(scores) 
+        
+        # 3. 稀疏化 (Top-K)
+        # 对每一行保留前 k 个最大值
+        mask = torch.zeros_like(scores)
+        top_k_values, top_k_indices = torch.topk(scores, k=self.top_k, dim=-1)
+        
+        # 使用 scatter 构建掩码
+        mask.scatter_(-1, top_k_indices, 1.0)
+        
+        # 4. Softmax 归一化
+        scores = scores * mask
+        adj_dynamic = F.softmax(scores, dim=-1)
+        
+        return adj_dynamic
+
+# ==========================================
 # 新增: GAT Layer (图注意力层)
 # ==========================================
 class GATLayer(nn.Module):
@@ -142,32 +180,44 @@ class MultiScaleSTGATBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(MultiScaleSTGATBlock, self).__init__()
         
-        # 1. GAT 部分 (替代原有的 Linear GCN)
-        self.gat = GATLayer(in_channels, out_channels)
+        # Residual Projection
+        self.residual_proj = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
         
-        # 2. 多尺度 TCN 部分 (保持不变)
-        # 分支 1: Kernel 3
+        # Layer Normalization for stability
+        self.norm = nn.GroupNorm(8, out_channels)
+        
+        # 1. Multi-Head GAT (4 heads)
+        self.num_heads = 4
+        assert out_channels % self.num_heads == 0, "out_channels must be divisible by num_heads (4)"
+        self.head_dim = out_channels // self.num_heads
+        
+        self.gat_heads = nn.ModuleList([
+            GATLayer(in_channels, self.head_dim) for _ in range(self.num_heads)
+        ])
+        
+        # 2. 多尺度 TCN 部分 (Replace BN with GroupNorm for B=16)
+        # Groups=8 is a safe default
         self.tcn3 = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(8, out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=(3, 1), padding=((3-1)//2, 0)),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(8, out_channels),
             nn.Dropout(0.5)
         )
         # 分支 2: Kernel 5
         self.tcn5 = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(8, out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=(5, 1), padding=((5-1)//2, 0)),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(8, out_channels),
             nn.Dropout(0.5)
         )
         # 分支 3: Kernel 7
         self.tcn7 = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(8, out_channels),
             nn.ReLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=(7, 1), padding=((7-1)//2, 0)),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(8, out_channels),
             nn.Dropout(0.5)
         )
         
@@ -176,6 +226,7 @@ class MultiScaleSTGATBlock(nn.Module):
 
     def forward(self, x, adj):
         # x: (B, C, T, V)
+        x_in = x
         B, C, T, V = x.shape
         
         # --- GAT ---
@@ -183,8 +234,19 @@ class MultiScaleSTGATBlock(nn.Module):
         # 这里我们将时间维 T 融合进 Batch 维，对每个时间步的图进行卷积
         x_gat_in = x.permute(0, 2, 3, 1).contiguous().view(B*T, V, C) # (B*T, V, C)
         
-        # 如果 adj 是 (V, V)，这里会自动广播
-        x_gat_out = self.gat(x_gat_in, adj) # (B*T, V, Out)
+        # Multi-Head Forward
+        # 广播调整:
+        # adj: (B, N, N) -> (B*T, N, N) 或者是 (N, N)
+        # 如果是 Dynamic Graph (B, N, N)，需要 repeat T 次以匹配 (B*T, V, C)
+        if adj.dim() == 3:
+             # adj: (B, N, N)
+             # View as (B, 1, N, N) -> repeat -> (B, T, N, N) -> reshape -> (B*T, N, N)
+             adj_expanded = adj.unsqueeze(1).repeat(1, T, 1, 1).view(-1, V, V)
+        else:
+             adj_expanded = adj
+             
+        head_outs = [gat(x_gat_in, adj_expanded) for gat in self.gat_heads]
+        x_gat_out = torch.cat(head_outs, dim=-1) # (B*T, V, Out)
         
         # 还原维度: (B, T, V, Out) -> (B, Out, T, V)
         x = x_gat_out.view(B, T, V, -1).permute(0, 3, 1, 2)
@@ -197,7 +259,11 @@ class MultiScaleSTGATBlock(nn.Module):
         out = torch.cat([b3, b5, b7], dim=1) # (B, 3C, T, V)
         out = self.fusion(out)
         
-        return out
+        # Residual Connection
+        res = self.residual_proj(x_in)
+        
+        # Pre-Norm or Post-Norm? Post-Norm here.
+        return self.norm(F.relu(out + res))
 
 class GradientReversal(torch.autograd.Function):
     @staticmethod
@@ -213,12 +279,31 @@ class GradientReversal(torch.autograd.Function):
 def grad_reverse(x, alpha=1.0):
     return GradientReversal.apply(x, alpha)
 
+class TemporalAttentionPooling(nn.Module):
+    def __init__(self, input_dim):
+        super(TemporalAttentionPooling, self).__init__()
+        self.attn = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 1, bias=False)
+        )
+        
+    def forward(self, x):
+        # x: (Batch, Time, Hidden)
+        attn_weights = F.softmax(self.attn(x), dim=1) # (B, T, 1)
+        return torch.sum(x * attn_weights, dim=1)
+
 class ASDClassifier(nn.Module):
     def __init__(self, adj, num_nodes=200, time_steps=80, hidden_dim=64, num_sites=17):
         super(ASDClassifier, self).__init__()
         
         self.adj = nn.Parameter(adj.clone(), requires_grad=True)
         self.num_nodes = num_nodes
+        
+        # Adaptive Graph Learner
+        self.graph_learner = GraphLearner(input_dim=time_steps, top_k=15)
+        # Learnable fusion weight (init at 0.1)
+        self.adj_fusion_weight = nn.Parameter(torch.tensor(0.1))
         
         # ==========================
         # Stream 1: ST-GAT (时空流)
@@ -239,6 +324,9 @@ class ASDClassifier(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
         
+        # Temporal Attention Pooling (Replaces Mean Pooling)
+        self.temp_pool = TemporalAttentionPooling(hidden_dim)
+        
         # ==========================
         # Stream 2: Tangent Space (几何流)
         # ==========================
@@ -246,12 +334,19 @@ class ASDClassifier(nn.Module):
         tangent_input_dim = num_nodes * (num_nodes + 1) // 2
         
         self.tangent_net = nn.Sequential(
-            nn.Linear(tangent_input_dim, 256),
-            nn.BatchNorm1d(256),
+            nn.Dropout(0.6), # <--- Input Dropout (Critical for high-dim inputs)
+            nn.Linear(tangent_input_dim, 128), # Reduced capacity (256 -> 128)
+            nn.BatchNorm1d(128),
             nn.LeakyReLU(0.1),
-            nn.Dropout(0.5),
-            nn.Linear(256, hidden_dim), # 投影到与 ST-GAT 相同的维度
+            nn.Dropout(0.6),
+            nn.Linear(128, hidden_dim), 
             nn.ReLU()
+        )
+        
+        # Gated Fusion Mechanism
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 2, 2),
+            nn.Sigmoid()
         )
         
         # ==========================
@@ -275,15 +370,29 @@ class ASDClassifier(nn.Module):
             nn.Dropout(0.5),
             nn.Linear(32, num_sites)
         )
+        
+        # Deep Supervision (Auxiliary Classifiers)
+        self.aux_classifier_st = nn.Linear(hidden_dim, 2)
+        self.aux_classifier_geo = nn.Linear(hidden_dim, 2)
 
     def forward(self, x, alpha=1.0):
         # x: (Batch, Time, Nodes)
         
         # --- Stream 1: Spatiotemporal (GAT + Transformer) ---
+        # 自适应图学习 (利用原始时间序列作为特征)
+        # x: (B, T, N) -> (B, N, T)
+        x_node_feat = x.permute(0, 2, 1) 
+        adj_dyn = self.graph_learner(x_node_feat) # (B, N, N)
+        
+        # 融合静态图和动态图: Adj_final = Adj_static + lambda * Adj_dynamic
+        # 限制 lambda 在 [0, 1] 之间 (Optional, but safe)
+        fusion_w = torch.clamp(self.adj_fusion_weight, 0, 1)
+        adj_combined = self.adj.unsqueeze(0) + fusion_w * adj_dyn
+        
         x_st = x.unsqueeze(1) # (B, 1, T, N) for Conv2d
         
-        x_st = self.st_gat1(x_st, self.adj)
-        x_st = self.st_gat2(x_st, self.adj) # (B, hidden, T, N)
+        x_st = self.st_gat1(x_st, adj_combined)
+        x_st = self.st_gat2(x_st, adj_combined) # (B, hidden, T, N)
         
         x_st = x_st.permute(0, 2, 3, 1) # (B, T, N, hidden)
         x_st = self.feature_bottleneck(x_st) # (B, T, N, 16)
@@ -294,7 +403,8 @@ class ASDClassifier(nn.Module):
         x_st = self.spatial_proj(x_st)
         x_st = self.transformer(x_st)
         
-        feat_st = torch.mean(x_st, dim=1) # (B, hidden_dim) - Temporal Pooling
+        # feat_st = torch.mean(x_st, dim=1) # (B, hidden_dim) - Temporal Pooling
+        feat_st = self.temp_pool(x_st) # Attention Pooling
         
         # --- Stream 2: Tangent Space Geometry ---
         # 这是一个无需训练参数的数学变换，但特征很大，所以在 forward 里算
@@ -302,14 +412,26 @@ class ASDClassifier(nn.Module):
         feat_geo = self.tangent_net(feat_geo_raw) # (B, hidden_dim)
         
         # --- Feature Fusion ---
-        features = torch.cat([feat_st, feat_geo], dim=1) # (B, 2*hidden_dim)
+        # --- Feature Fusion (Gated) ---
+        # features = torch.cat([feat_st, feat_geo], dim=1) # (B, 2*hidden_dim)
+        combined_raw = torch.cat([feat_st, feat_geo], dim=1)
+        gates = self.fusion_gate(combined_raw) # (B, 2)
+        
+        feat_st_gated = feat_st * gates[:, 0:1]
+        feat_geo_gated = feat_geo * gates[:, 1:2]
+        
+        features = torch.cat([feat_st_gated, feat_geo_gated], dim=1)
         
         # --- Outputs ---
-        # 1. ASD Classification
+        # 1. ASD Classification (Result of Fusion)
         class_logits = self.classifier(features)
         
-        # 2. Site Discrimination (Gradient Reversal)
+        # 2. Auxiliary Classifications (Deep Supervision)
+        logits_st = self.aux_classifier_st(feat_st)
+        logits_geo = self.aux_classifier_geo(feat_geo)
+        
+        # 3. Site Discrimination (Gradient Reversal)
         reversed_features = grad_reverse(features, alpha)
         site_logits = self.site_classifier(reversed_features)
         
-        return class_logits, site_logits
+        return class_logits, site_logits, logits_st, logits_geo
