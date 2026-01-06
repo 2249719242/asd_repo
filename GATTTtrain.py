@@ -5,217 +5,231 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split, GroupKFold
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report, roc_auc_score
+import random
+import os
+import sys
 
 # 从模型文件导入
 from GATTT import ASDClassifier, compute_adj_matrix
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
-    model.train()
-    running_loss = 0.0
-    all_preds = []
-    all_labels = []
-    
-    for i, (batch_x, batch_y) in enumerate(loader):
-        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(batch_x)
-        loss = criterion(outputs, batch_y)
-        loss.backward()
-        
-        # 梯度裁剪，保证 Transformer 训练稳定性
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        
-        running_loss += loss.item()
-        _, preds = torch.max(outputs, 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(batch_y.cpu().numpy())
-        
-        if (i + 1) % 10 == 0:
-            print(f"    Batch {i+1}/{len(loader)} | Loss: {loss.item():.4f}")
-        
-    return running_loss / len(loader), accuracy_score(all_labels, all_preds)
+def set_seed(seed=42):
+    """固定所有随机种子以确保结果可复现"""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-def validate(model, loader, criterion, device):
-    model.eval()
-    running_loss = 0.0
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch_x, batch_y in loader:
-            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            
-            running_loss += loss.item()
-            _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_y.cpu().numpy())
-            
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    return running_loss / len(loader), acc, f1, all_preds, all_labels
-
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit
-
-def validate_subject_wise(model, X, y, groups, criterion, device, batch_size=32):
+def validate_subject_wise(model, X, y, groups, device, batch_size=32):
     """
     按被试维度进行评估：聚合一个被试所有窗口的预测结果。
+    返回: Acc, F1, AUC, Sensitivity, Specificity
     """
     model.eval()
     unique_groups = np.unique(groups)
-    all_subject_preds = []
-    all_subject_labels = []
-    total_loss = 0
     
-    # 为了方便索引，这里使用简单的 DataLoader 遍历所有窗口，然后按 group 聚合
+    all_subject_preds = []   # 预测类别 (0或1)
+    all_subject_labels = []  # 真实类别
+    all_subject_probs = []   # 预测为 ASD (1) 的概率
+    
+    # 构造简单的 DataLoader
     dataset = TensorDataset(torch.FloatTensor(X), torch.LongTensor(y))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     
     all_window_probs = []
+    
     with torch.no_grad():
         for batch_x, _ in loader:
             batch_x = batch_x.to(device)
-            # DANN 模式下 model 返回 (class_logits, site_logits, logits_st, logits_geo)
+            # DANN 模式下返回 (class_logits, site_logits, logits_st, logits_geo)
             outputs, _, _, _ = model(batch_x)
-            probs = F.softmax(outputs, dim=1)
+            probs = F.softmax(outputs, dim=1) # 转化为概率
             all_window_probs.extend(probs.cpu().numpy())
     
     all_window_probs = np.array(all_window_probs)
     
-    # 按 Subject ID 聚合
+    # === 按 Subject ID (Group) 聚合结果 ===
     for sub_id in unique_groups:
         idx = np.where(groups == sub_id)[0]
-        # Soft Voting: 平均所有窗口的概率
-        avg_prob = np.mean(all_window_probs[idx], axis=0)
-        pred = np.argmax(avg_prob)
         
-        all_subject_preds.append(pred)
-        # 获取该被试的真实标签（所有窗口标签一致）
-        all_subject_labels.append(y[idx[0]])
+        # Soft Voting: 平均该被试所有窗口的概率
+        avg_prob = np.mean(all_window_probs[idx], axis=0) # [prob_0, prob_1]
+        pred_label = np.argmax(avg_prob)
         
+        all_subject_preds.append(pred_label)
+        all_subject_labels.append(y[idx[0]]) # 真实标签
+        all_subject_probs.append(avg_prob[1]) # 关注正类 (ASD) 的概率用于计算 AUC
+        
+    # === 计算各项指标 ===
     acc = accuracy_score(all_subject_labels, all_subject_preds)
-    f1 = f1_score(all_subject_labels, all_subject_preds)
+    f1 = f1_score(all_subject_labels, all_subject_preds, zero_division=0)
     
-    return acc, f1, all_subject_preds, all_subject_labels
+    try:
+        # 只有当测试集中同时包含两类样本时，才能计算 AUC
+        if len(np.unique(all_subject_labels)) > 1:
+            auc = roc_auc_score(all_subject_labels, all_subject_probs)
+        else:
+            auc = 0.5 
+    except ValueError:
+        auc = 0.5
+    
+    tn, fp, fn, tp = confusion_matrix(all_subject_labels, all_subject_preds).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0 # Recall
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
+    return {
+        'acc': acc, 
+        'f1': f1, 
+        'auc': auc, 
+        'sens': sensitivity, 
+        'spec': specificity
+    }
 
 def main():
-    # 1. 配置
+    # 1. 全局配置
+    set_seed(42) # 固定种子
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    BATCH_SIZE = 16 # Reduced from 64 to avoid OOM with Multi-Head GAT
-    ACCUM_STEPS = 4 # Simulate Batch Size 64
+    
+    # 超参数
+    BATCH_SIZE = 16 
+    ACCUM_STEPS = 4 
     LR = 5e-5 
     EPOCHS = 100
+    N_FOLDS = 5 # 五折交叉验证
     
     # 2. 加载数据
-    print("加载增广数据...")
+    print("正在加载数据...")
+    if not os.path.exists('X_augmented.npy'):
+        print("错误: 找不到数据文件 (X_augmented.npy 等)。请确保路径正确。")
+        return
+
     X = np.load('X_augmented.npy')      
     y = np.load('y_augmented.npy')      
     groups = np.load('groups_augmented.npy') 
-    sites = np.load('sites_augmented.npy') # 加载站点标签
+    sites = np.load('sites_augmented.npy') 
     
     num_sites = len(np.unique(sites))
-    print(f"检测到站点数量: {num_sites}")
+    print(f"数据加载完毕. Shape: {X.shape}, Sites: {num_sites}")
     
-    # 3. 单次切分验证 (GroupShuffleSplit)
-    from sklearn.model_selection import GroupShuffleSplit
+    # 3. 准备五折交叉验证
+    gkf = GroupKFold(n_splits=N_FOLDS)
     
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, val_idx = next(gss.split(X, y, groups))
+    # 存储每一折的最佳结果
+    fold_results = []
     
-    print(f"\n启动单次切分验证 (站点对抗版)...")
-    print(f"训练集窗口数: {len(train_idx)} | 验证集窗口数: {len(val_idx)}")
-
-    X_train, y_train, sites_train = X[train_idx], y[train_idx], sites[train_idx]
-    X_val, y_val, groups_val = X[val_idx], y[val_idx], groups[val_idx]
+    print(f"\n{'='*20} 开始 {N_FOLDS}-Fold Cross Validation {'='*20}")
     
-    # 计算邻接矩阵
-    adj = compute_adj_matrix(X_train, top_k=15)
-    
-    # Update DataLoader
-    train_loader = DataLoader(
-        TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train), torch.LongTensor(sites_train)), 
-        batch_size=BATCH_SIZE, shuffle=True, drop_last=True
-    )
-    
-    # 初始化模型
-    model = ASDClassifier(adj=adj, num_nodes=200, time_steps=80, num_sites=num_sites).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=5e-3)
-    
-    class_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    site_criterion = nn.CrossEntropyLoss()
-    
-    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
-    # 使用 Cosine Annealing with Warm Restarts
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-6)
-    
-    best_val_acc = 0.0
-    
-    for epoch in range(EPOCHS):
-        model.train()
-        running_loss = 0.0
-        optimizer.zero_grad() # Initialize gradients
+    # GroupKFold 需要由外层循环控制
+    # split(X, y, groups) 返回的是索引
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
+        print(f"\n>>> Fold {fold+1}/{N_FOLDS}")
+        print(f"训练集窗口数: {len(train_idx)} | 验证集窗口数: {len(val_idx)}")
         
-        all_preds = []
-        all_labels = []
+        # 数据切分
+        X_train, y_train, sites_train = X[train_idx], y[train_idx], sites[train_idx]
+        X_val, y_val, groups_val = X[val_idx], y[val_idx], groups[val_idx]
         
-        alpha = 1.0
+        # 计算当前 Fold 训练集的邻接矩阵 (严谨做法：只用训练集计算)
+        print("   计算邻接矩阵...")
+        adj = compute_adj_matrix(X_train, top_k=15).to(device)
         
-        for i, (batch_x, batch_y, batch_sites) in enumerate(train_loader):
-            batch_x, batch_y, batch_sites = batch_x.to(device), batch_y.to(device), batch_sites.to(device)
-            
-            # Dynamic Alpha for DANN
-            p = float(i + epoch * len(train_loader)) / EPOCHS / len(train_loader)
-            alpha = 2. / (1. + np.exp(-10 * p)) - 1
-            
-            class_logits, site_logits, logits_st, logits_geo = model(batch_x, alpha=alpha)
-            
-            loss_class = class_criterion(class_logits, batch_y)
-            loss_st = class_criterion(logits_st, batch_y)
-            loss_geo = class_criterion(logits_geo, batch_y)
-            loss_site = site_criterion(site_logits, batch_sites)
-            
-            # Deep Supervision weights: 0.3 for aux branches (reduced to focus on fusion)
-            loss = (loss_class + 0.3 * loss_st + 0.3 * loss_geo + 0.05 * loss_site) / ACCUM_STEPS
-            
-            loss.backward()
-            
-            if (i + 1) % ACCUM_STEPS == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                # Cosine Scheduler step (approximately per effective batch)
-                scheduler.step(epoch + i / len(train_loader))
-            
-            running_loss += loss.item() * ACCUM_STEPS # Scale back up for display
-            _, preds = torch.max(class_logits, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch_y.cpu().numpy())
-            
-            if (i + 1) % 20 == 0:
-                 print(f"    Batch {i+1} | Main: {loss_class.item():.3f} | AuxST: {loss_st.item():.3f} | AuxGeo: {loss_geo.item():.3f} | Site: {loss_site.item():.3f}")
-
-        train_loss = running_loss / len(train_loader)
-        train_acc = accuracy_score(all_labels, all_preds)
+        # DataLoader
+        train_dataset = TensorDataset(
+            torch.FloatTensor(X_train), 
+            torch.LongTensor(y_train), 
+            torch.LongTensor(sites_train)
+        )
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
         
-        val_acc, val_f1, _, _ = validate_subject_wise(model, X_val, y_val, groups_val, class_criterion, device)
+        # 初始化模型 (每个 Fold 必须重新初始化)
+        model = ASDClassifier(adj=adj, num_nodes=200, time_steps=80, num_sites=num_sites).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=5e-3)
         
-        # scheduler.step(val_acc) # Removed for Cosine
+        # 损失函数
+        class_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        site_criterion = nn.CrossEntropyLoss()
         
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_asd_model_dann.pth')
+        # 学习率调度器
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-6)
         
-        if (epoch + 1) % 5 == 0:
-            print(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} | Best: {best_val_acc:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
+        best_fold_metrics = {'acc': 0.0, 'f1': 0.0, 'auc': 0.0, 'sens': 0.0, 'spec': 0.0}
+        
+        # === 训练循环 ===
+        for epoch in range(EPOCHS):
+            model.train()
+            optimizer.zero_grad()
+            running_loss = 0.0
             
-    print(f"\n训练结束. 最佳 Acc: {best_val_acc:.4f}")
-
+            for i, (batch_x, batch_y, batch_sites) in enumerate(train_loader):
+                batch_x, batch_y, batch_sites = batch_x.to(device), batch_y.to(device), batch_sites.to(device)
+                
+                # Dynamic Alpha for DANN
+                p = float(i + epoch * len(train_loader)) / EPOCHS / len(train_loader)
+                alpha = 2. / (1. + np.exp(-10 * p)) - 1
+                
+                # Forward
+                class_logits, site_logits, logits_st, logits_geo = model(batch_x, alpha=alpha)
+                
+                # Loss
+                loss_class = class_criterion(class_logits, batch_y)
+                loss_st = class_criterion(logits_st, batch_y)
+                loss_geo = class_criterion(logits_geo, batch_y)
+                loss_site = site_criterion(site_logits, batch_sites)
+                
+                # Total Loss
+                loss = (loss_class + 0.3 * loss_st + 0.3 * loss_geo + 0.05 * loss_site) / ACCUM_STEPS
+                loss.backward()
+                
+                if (i + 1) % ACCUM_STEPS == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step(epoch + i / len(train_loader))
+                
+                running_loss += loss.item() * ACCUM_STEPS
+            
+            # === 验证 (按被试聚合) ===
+            val_metrics = validate_subject_wise(model, X_val, y_val, groups_val, device)
+            
+            # 更新最佳结果 (以 Acc 为主，也可以改为 AUC 或 F1)
+            if val_metrics['acc'] > best_fold_metrics['acc']:
+                best_fold_metrics = val_metrics
+                # 保存当前 Fold 的最佳模型
+                torch.save(model.state_dict(), f'best_model_fold_{fold+1}.pth')
+            
+            # 打印进度
+            if (epoch + 1) % 5 == 0:
+                 print(f"   Epoch {epoch+1:03d} | Loss: {running_loss/len(train_loader):.4f} | "
+                       f"Val Acc: {val_metrics['acc']:.4f} (Best: {best_fold_metrics['acc']:.4f}) | "
+                       f"AUC: {val_metrics['auc']:.4f}")
+        
+        print(f" Fold {fold+1} Finished. Best Metrics: {best_fold_metrics}")
+        fold_results.append(best_fold_metrics)
+        
+    # 4. 汇总结果
+    print(f"\n{'='*20} 5-Fold Result Summary {'='*20}")
+    metrics_keys = ['acc', 'f1', 'auc', 'sens', 'spec']
+    
+    # 打印平均值
+    for key in metrics_keys:
+        values = [res[key] for res in fold_results]
+        mean_val = np.mean(values)
+        std_val = np.std(values)
+        print(f"{key.upper()}: {mean_val:.4f} ± {std_val:.4f}")
+        
+    # 保存结果到 CSV
+    df = pd.DataFrame(fold_results)
+    # 添加 Mean 和 Std 行
+    df.loc['Mean'] = df.mean()
+    df.loc['Std'] = df.std()
+    
+    df.to_csv('5_fold_results_summary.csv')
+    print("\n详细结果已保存至 '5_fold_results_summary.csv'")
 
 if __name__ == "__main__":
     main()
